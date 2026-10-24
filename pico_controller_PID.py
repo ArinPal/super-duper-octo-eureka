@@ -16,14 +16,13 @@ CODE MODULARITY AND TECHNIQUES MENTIONED LIKE THIS WILL HELP YOU GAINING MORE MA
 
 # Importing the required libraries
 
-
+import rclpy
 from swift_msgs.msg import SwiftMsgs
 from whycode_interfaces.msg import MarkerArray
 from controller_msg.msg import PIDTune
 from error_msg.msg import Error
 from std_msgs.msg import Header
 import time
-import rclpy
 from rclpy.node import Node
 
 
@@ -56,7 +55,7 @@ class Swift_Pico(Node):
 		#initial setting of Kp, Kd and ki for [roll, pitch, throttle]. eg: self.Kp[2] corresponds to Kp value in throttle axis
 		#after tuning and computing corresponding PID parameters, change the parameters
 
-		self.Kp = [0, 0, 0]
+		self.Kp = [0, 0, 80]
 		self.Ki = [0, 0, 0]
 		self.Kd = [0, 0, 0]
 
@@ -67,16 +66,17 @@ class Swift_Pico(Node):
 		self.error_sum_limit = 5000.0
 		self.max_values = [2000, 2000, 2000]  
 		self.min_values = [1000, 1000, 1000]   
-		
+		self.pos_error = Error()
 
 
 
 
 
 
-		# Hint : Add variables for storing previous errors in each axis, like self.prev_error = [0,0,0] where corresponds to [pitch, roll, throttle]		#		 Add variables for limiting the values like self.max_values = [2000,2000,2000] corresponding to [roll, pitch, throttle]
-		#													self.min_values = [1000,1000,1000] corresponding to [pitch, roll, throttle]
-		#																	You can change the upper limit and lower limit accordingly. 
+		# Hint : Add variables for storing previous errors in each axis, like self.prev_error = [0,0,0] where corresponds to [pitch, roll, throttle]		
+		# 	 Add variables for limiting the values like self.max_values = [2000,2000,2000] corresponding to [roll, pitch, throttle]
+		#									self.min_values = [1000,1000,1000] corresponding to [pitch, roll, throttle]
+		#														You can change the upper limit and lower limit accordingly. 
 		#----------------------------------------------------------------------------------------------------------
 
 		# # This is the sample time in which you need to run pid. Choose any time which you seem fit.
@@ -113,6 +113,7 @@ class Swift_Pico(Node):
 		hb = Header()
 		hb.stamp = self.get_clock().now().to_msg()
 		hb.frame_id = 'pico_controller_active'
+		self.get_logger().info('Heartbeat.\n')
 		self.heartbeat_pub.publish(hb)
 
 	def disarm(self):
@@ -137,6 +138,9 @@ class Swift_Pico(Node):
 	# Whycode callback function
 	# The function gets executed each time when /whycode_node publishes /whycode_node/markers
 	def whycode_callback(self, msg):
+		if not msg.markers:
+			return
+
 		self.current_state[0] = msg.markers[0].position.position.x
 		#--------------------Set the remaining co-ordinates of the drone from msg----------------------------------------------
 		self.current_state[1] = msg.markers[0].position.position.y
@@ -149,9 +153,9 @@ class Swift_Pico(Node):
 	# Callback function for /throttle_pid
 	# This function gets executed each time when /drone_pid_tuner publishes /throttle_pid
 	def altitude_set_pid(self, alt):
-		self.Kp[2] = alt.kp * 0.03  # This is just for an example. You can change the ratio/fraction value accordingly
-		self.Ki[2] = alt.ki * 0.008
-		self.Kd[2] = alt.kd * 0.6
+		self.Kp[2] = alt.kp * 80.1  # This is just for an example. You can change the ratio/fraction value accordingly
+		self.Ki[2] = alt.ki * 0.112
+		self.Kd[2] = alt.kd * 69.6
 
 	#----------------------------Define callback function like altitide_set_pid to tune pitch, roll--------------
 	def pitch_set_pid(self, pitch): 
@@ -186,24 +190,25 @@ class Swift_Pico(Node):
 		          self.current_state[1] - self.desired_state[1],   #Pitch	
 				  self.current_state[2] - self.desired_state[2] ]  #Throttle
 
-		#7 AND 8
-		for i in range(3):
-			self.prev_error[i] = error[i]
-			self.error_sum[i] += error[i]
-			self.error_sum[i] = max(-self.error_sum_limit, min(self.error_sum_limit, self.error_sum[i]))
 
 		#3
 		PID_output = [ self.Kp[i] * error[i] + self.Ki[i] * self.error_sum[i] + self.Kd[i] * (error[i] - self.prev_error[i]) for i in range(3) ]  #Roll, Pitch, Throttle	
 
 		#4
-		self.cmd.rc_roll = (1500 - PID_output[0])
-		self.cmd.rc_pitch = (1500 - PID_output[1])
-		self.cmd.rc_throttle = (1500 + PID_output[2])
+		self.cmd.rc_roll = int(1500 - PID_output[0])
+		self.cmd.rc_pitch = int(1500 - PID_output[1])
+		self.cmd.rc_throttle = int(1500 + PID_output[2])
 		
 		#6
-		self.cmd.rc_roll = max(self.min_values[0], min(self.max_values[0], PID_output[0]))
-		self.cmd.rc_pitch = max(self.min_values[1], min(self.max_values[1], PID_output[1]))
-		self.cmd.rc_throttle = max(self.min_values[2], min(self.max_values[2], PID_output[2]))
+		self.cmd.rc_roll = int(max(self.min_values[0], min(self.max_values[0], self.cmd.rc_roll)))
+		self.cmd.rc_pitch = int(max(self.min_values[1], min(self.max_values[1], self.cmd.rc_pitch)))
+		self.cmd.rc_throttle = int(max(self.min_values[2],min(self.max_values[2], self.cmd.rc_throttle)))
+
+		#7 AND 8
+		for i in range(3):
+			self.prev_error[i] = error[i]
+			self.error_sum[i] += error[i]
+			self.error_sum[i] = max(-self.error_sum_limit, min(self.error_sum_limit, self.error_sum[i]))
 
 
 
