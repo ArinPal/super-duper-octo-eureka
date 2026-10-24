@@ -46,7 +46,7 @@ class WayPointServer(Node):
 
         self.yaw = 0.0              # current yaw in degrees (updated from whycode)
         self.desired_yaw = -0.5     # target yaw angle (degrees)
-        self.curr_state = [0.0, 0.0, 0.0]
+        self.current_state = [0.0, 0.0, 0.0]
         self.desired_state = [0.0, 0.0, 0.0]
         self.drone_position = [0.0, 0.0, 0.0]
         self.xyz = [0.0, 0.0, 0.0, 0.0]
@@ -67,7 +67,7 @@ class WayPointServer(Node):
         self.Kd = [0.0, 0.0, 0.0]
         self.prev_error = [0.0, 0.0, 0.0]
         self.error_sum = [0.0, 0.0, 0.0]
-        self.error_sum_limit = 25.0
+        self.error_sum_limit = 5000.0               #change limit after testing
         self.max_values = [2000, 2000, 2000]
         self.min_values = [1000, 1000, 1000]
         self.pos_error = Error()
@@ -75,7 +75,7 @@ class WayPointServer(Node):
 
 
 
-        self.sample_time = 0.01666 #put the appropriate value according to your controller
+        self.sample_time = 0.033 #put the appropriate value according to your controller
 
         self.command_pub = self.create_publisher(SwiftMsgs, '/drone_command', 10)
         self.pos_error_pub = self.create_publisher(Error, '/pos_error', 10)
@@ -107,7 +107,6 @@ class WayPointServer(Node):
         self.timer = self.create_timer(self.sample_time, self.pid, callback_group=self.pid_or_lqr_callback_group)
 
     def pid(self):
-    #-----------------------------Write the PID algorithm here--------------------------------------------------------------
    
     
         #1
