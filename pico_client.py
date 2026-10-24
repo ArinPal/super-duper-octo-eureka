@@ -34,8 +34,6 @@ class WayPointClient(Node):
         future = self.waypoint_client.call_async(request)
         future.add_done_callback(self.waypoints_callback)
 
-        poses = future.result().waypoints.poses
-        marker_ids = future.result().marker_ids
     
     ###action client functions
 
@@ -49,7 +47,7 @@ class WayPointClient(Node):
         goal_msg.waypoint.position.z = waypoint[2]
 
         #create a method waits for the action server to be available.
-        if not self.action_client.wait_for_server(timeout_sec=5.0):
+        if not self.waypoint_navigation.wait_for_server(timeout_sec=5.0):
                     self.get_logger().error('Action server not available')
                     return
 
