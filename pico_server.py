@@ -60,6 +60,18 @@ class WayPointServer(Node):
         self.cmd.rc_throttle = 1400
 
         #Initiate or declare other variables here depending upon whether you are implementing PID or LQR controller.
+        # PID controller state variables
+        self.current_state = [0.0, 0.0, 0.0]          # [x, y, z] from whycode
+        self.Kp = [0.0, 0.0, 0.0]
+        self.Ki = [0.0, 0.0, 0.0]
+        self.Kd = [0.0, 0.0, 0.0]
+        self.prev_error = [0.0, 0.0, 0.0]
+        self.error_sum = [0.0, 0.0, 0.0]
+        self.error_sum_limit = 25.0
+        self.max_values = [2000, 2000, 2000]
+        self.min_values = [1000, 1000, 1000]
+        self.pos_error = Error()
+        
 
 
 
@@ -71,6 +83,9 @@ class WayPointServer(Node):
 
         self.create_subscription(MarkerArray, '/whycode_node/markers', self.whycode_callback, 1)
         #Add other subscribers here
+        self.create_subscription(PIDTune, "/throttle_pid", self.altitude_set_pid, 1)
+        self.create_subscription(PIDTune, "/pitch_pid", self.pitch_set_pid, 1)
+        self.create_subscription(PIDTune, "/roll_pid", self.roll_set_pid, 1)
 
         self.create_subscription(Odometry, '/rotors/odometry', self.odometry_callback, 10, callback_group=self.odometry_callback_group)
 
@@ -167,8 +182,8 @@ class WayPointServer(Node):
 
         marker = msg.markers[0]
         position = marker.position.position
-        self.curr_state = [position.x, position.y, position.z]
-        self.drone_position = self.curr_state[:]
+        self.current_state = [position.x, position.y, position.z]
+        self.drone_position = self.current_state[:]
 
         # the yaw controller works in degrees, so convert here.
         self.yaw = math.degrees(marker.rotation.z)
@@ -179,20 +194,19 @@ class WayPointServer(Node):
     #If you are using LQR controller, then define a functions which were given in the boiler plate code of task 1c and the ones which you have defined on yur own.
 
     # Callback function for /throttle_pid
-        # This function gets executed each time when /drone_pid_tuner publishes /throttle_pid
-        def altitude_set_pid(self, alt):
+    # This function gets executed each time when /drone_pid_tuner publishes /throttle_pid
+    def altitude_set_pid(self, alt):
             self.Kp[2] = alt.kp   # This is just for an example. You can change the ratio/fraction value accordingly
             self.Ki[2] = alt.ki 
             self.Kd[2] = alt.kd 
     
-        #----------------------------Define callback function like altitide_set_pid to tune pitch, roll--------------
-        def pitch_set_pid(self, pitch): 
+    def pitch_set_pid(self, pitch): 
             self.Kp[1] = pitch.kp 
             self.Ki[1] = pitch.ki 
             self.Kd[1] = pitch.kd 
     
     
-        def roll_set_pid(self, roll):
+    def roll_set_pid(self, roll):
             self.Kp[0] = roll.kp 
             self.Ki[0] = roll.ki 
             self.Kd[0] = roll.kd 
@@ -231,9 +245,9 @@ class WayPointServer(Node):
 
         while True:
 			#current whycon poses
-            self.feedback_msg.current_waypoint.pose.position.x = self.curr_state[0]
-            self.feedback_msg.current_waypoint.pose.position.y = self.curr_state[1]
-            self.feedback_msg.current_waypoint.pose.position.z = self.curr_state[2]
+            self.feedback_msg.current_waypoint.pose.position.x = self.current_state[0]
+            self.feedback_msg.current_waypoint.pose.position.y = self.current_state[1]
+            self.feedback_msg.current_waypoint.pose.position.z = self.current_state[2]
             self.feedback_msg.current_waypoint.header.stamp.sec = self.max_time_inside_sphere
 
             goal_handle.publish_feedback(self.feedback_msg)
