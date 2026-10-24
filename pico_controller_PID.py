@@ -55,7 +55,7 @@ class Swift_Pico(Node):
 		#initial setting of Kp, Kd and ki for [roll, pitch, throttle]. eg: self.Kp[2] corresponds to Kp value in throttle axis
 		#after tuning and computing corresponding PID parameters, change the parameters
 
-		self.Kp = [0, 0, 80]
+		self.Kp = [0, 0, 0]
 		self.Ki = [0, 0, 0]
 		self.Kd = [0, 0, 0]
 
@@ -63,7 +63,7 @@ class Swift_Pico(Node):
 
 		self.prev_error = [0, 0, 0]  # previous error for each axis
 		self.error_sum = [0, 0, 0]  # sum of errors
-		self.error_sum_limit = 5000.0
+		self.error_sum_limit = 25.0
 		self.max_values = [2000, 2000, 2000]  
 		self.min_values = [1000, 1000, 1000]   
 		self.pos_error = Error()
@@ -113,7 +113,6 @@ class Swift_Pico(Node):
 		hb = Header()
 		hb.stamp = self.get_clock().now().to_msg()
 		hb.frame_id = 'pico_controller_active'
-		self.get_logger().info('Heartbeat.\n')
 		self.heartbeat_pub.publish(hb)
 
 	def disarm(self):
@@ -153,21 +152,21 @@ class Swift_Pico(Node):
 	# Callback function for /throttle_pid
 	# This function gets executed each time when /drone_pid_tuner publishes /throttle_pid
 	def altitude_set_pid(self, alt):
-		self.Kp[2] = alt.kp * 80.1  # This is just for an example. You can change the ratio/fraction value accordingly
-		self.Ki[2] = alt.ki * 0.112
-		self.Kd[2] = alt.kd * 69.6
+		self.Kp[2] = alt.kp   # This is just for an example. You can change the ratio/fraction value accordingly
+		self.Ki[2] = alt.ki 
+		self.Kd[2] = alt.kd 
 
 	#----------------------------Define callback function like altitide_set_pid to tune pitch, roll--------------
 	def pitch_set_pid(self, pitch): 
-		self.Kp[1] = pitch.kp * 0.03
-		self.Ki[1] = pitch.ki * 0.008
-		self.Kd[1] = pitch.kd * 0.6
+		self.Kp[1] = pitch.kp 
+		self.Ki[1] = pitch.ki 
+		self.Kd[1] = pitch.kd 
 
 
 	def roll_set_pid(self, roll):
-		self.Kp[0] = roll.kp * 0.03
-		self.Ki[0] = roll.ki * 0.008
-		self.Kd[0] = roll.kd * 0.6
+		self.Kp[0] = roll.kp 
+		self.Ki[0] = roll.ki 
+		self.Kd[0] = roll.kd 
 	#----------------------------------------------------------------------------------------------------------------------
 
 
@@ -192,7 +191,7 @@ class Swift_Pico(Node):
 
 
 		#3
-		PID_output = [ self.Kp[i] * error[i] + self.Ki[i] * self.error_sum[i] + self.Kd[i] * (error[i] - self.prev_error[i]) for i in range(3) ]  #Roll, Pitch, Throttle	
+		PID_output = [ self.Kp[i] * error[i] + self.Ki[i] * self.error_sum[i] + (self.Kd[i] * (error[i] - self.prev_error[i])) for i in range(3) ]  #Roll, Pitch, Throttle	
 
 		#4
 		self.cmd.rc_roll = int(1500 - PID_output[0])
@@ -207,9 +206,8 @@ class Swift_Pico(Node):
 		#7 AND 8
 		for i in range(3):
 			self.prev_error[i] = error[i]
-			self.error_sum[i] += error[i]
+			self.error_sum[i] += error[i]*self.sample_time
 			self.error_sum[i] = max(-self.error_sum_limit, min(self.error_sum_limit, self.error_sum[i]))
-
 
 
 
