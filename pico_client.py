@@ -1,140 +1,256 @@
 #!/usr/bin/env python3
 
-import time
-import rclpy
-from rclpy.action import ActionClient
-from rclpy.node import Node
+# This python file runs a ROS 2-node of name waypoint_server which implements an action server to navigate the Swift Pico Drone to the given waypoints.
+# You can use either PID or LQR controller to navigate the drone to the given waypoints.
 
-#import the action and service
+
+import time
+import math
+from tf_transformations import euler_from_quaternion
+
+import rclpy
+from rclpy.action import ActionServer
+from rclpy.node import Node
+from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
+
+#import control specific libraries
+
+#import the action
 from waypoint_navigation.action import NavToWaypoint
 from waypoint_navigation.srv import GetWaypoints
 
-class WayPointClient(Node):
+#pico control specific libraries
+from swift_msgs.msg import SwiftMsgs
+from std_msgs.msg import Header
+from whycode_interfaces.msg import MarkerArray
+from error_msg.msg import Error
+from controller_msg.msg import PIDTune
+from nav_msgs.msg import Odometry
+
+
+class WayPointServer(Node):
 
     def __init__(self):
-        super().__init__('waypoint_client')
-        self.goals = []
-        self.goal_index = 0
-        #create an action client for the action 'NavToWaypoint'. Refer to Writing an action server and client (Python) in ROS 2 tutorials
+        super().__init__('waypoint_server')
+
+        self.pid_or_lqr_callback_group = ReentrantCallbackGroup()
+        self.action_callback_group = ReentrantCallbackGroup()
+        self.odometry_callback_group = ReentrantCallbackGroup()
+
+        self.time_inside_sphere = 0
+        self.max_time_inside_sphere = 0
+        self.point_in_sphere_start_time = None
+        self.duration = 0
+
+
+        self.yaw = 0.0              # current yaw in degrees (updated from whycode)
+        self.desired_yaw = -0.5     # target yaw angle (degrees)
+        self.curr_state = [0.0, 0.0, 0.0]
+        self.desired_state = [0.0, 0.0, 0.0]
+        self.drone_position = [0.0, 0.0, 0.0]
+        self.xyz = [0.0, 0.0, 0.0, 0.0]
+        self.dtime = 0
+
+        # Declaring a cmd of message type swift_msgs and initializing values
+        self.cmd = SwiftMsgs()
+        self.cmd.rc_roll = 1500
+        self.cmd.rc_pitch = 1500
+        self.cmd.rc_yaw = 1500
+        self.cmd.rc_throttle = 1400
+
+        #Initiate or declare other variables here depending upon whether you are implementing PID or LQR controller.
+        self.Kp = [0.0, 0.0, 0.0]
+        self.Ki = [0.0, 0.0, 0.0]
+        self.Kd = [0.0, 0.0, 0.0]
+        self.prev_error = [0.0, 0.0, 0.0]
+        self.error_sum = [0.0, 0.0, 0.0]
+        self.max_values = [2000, 2000, 2000]
+        self.min_values = [1000, 1000, 1000]
+        self.pos_error = Error()
+        self.error_sum_limit = 5000.0
+
+        self.sample_time = 0.033 #put the appropriate value according to your controller
+
+
+        self.sample_time = 0.01666 #put the appropriate value according to your controller
+
+        self.command_pub = self.create_publisher(SwiftMsgs, '/drone_command', 10)
+        self.pos_error_pub = self.create_publisher(Error, '/pos_error', 10)
+        self.heartbeat_pub = self.create_publisher(Header, '/controller_heartbeat', 10)
+
+        self.create_subscription(MarkerArray, '/whycode_node/markers', self.whycode_callback, 1)
+        #Add other subscribers here
+        self.create_subscription(PIDTune, "/throttle_pid", self.altitude_set_pid, 1)
+        self.create_subscription(PIDTune, "/pitch_pid", self.pitch_set_pid, 1)
+        self.create_subscription(PIDTune, "/roll_pid", self.roll_set_pid, 1)
+
+        self.create_subscription(Odometry, '/rotors/odometry', self.odometry_callback, 10, callback_group=self.odometry_callback_group)
+
+        #create an action server for the action 'NavToWaypoint'. Refer to Writing an action server and client (Python) in ROS 2 tutorials
         #action name should 'waypoint_navigation'.
-        self.waypoint_navigation = self.create_action_client(self,NavToWaypoint, 'waypoint_navigation')
+        self.action_server = ActionServer(self, NavToWaypoint, 'waypoint_navigation', self.execute_callback, callback_group=self.action_callback_group)
+        #include the action_callback_group in the action server. Refer to executors in ROS 2 concepts
 
         
-        #create a client for the service 'GetWaypoints'. Refer to Writing a simple service and client (Python) in ROS 2 tutorials
-        #service name should be 'waypoints'
-        self.waypoint_client = self.create_client(self,GetWaypoints, 'waypoints')
-        
-        while not self.waypoint_client.wait_for_service(timeout_sec=1.0):
-            self.get_logger().info('service not available, waiting again...')
+        self.publish_heartbeat()
+        self.create_timer(0.1, self.publish_heartbeat)
 
-        #create a request object for GetWaypoints service.
-        request = GetWaypoints.Request()
-        request.get_waypoints = True
+        time.sleep(0.5)  # let the heartbeat reach the rosbag before arming
+        self.arm()
 
-        future = self.waypoint_client.call_async(request)
-        future.add_done_callback(self.waypoints_callback)
+        #define the function to be run inside the timer callback. This function will implement the PID or LQR algorithm
+        self.timer = self.create_timer(self.sample_time, self.pid_or_lqr_callback, callback_group=self.pid_or_lqr_callback_group)
 
-    
-    ###action client functions
+    def publish_heartbeat(self):
+        hb = Header()
+        hb.stamp = self.get_clock().now().to_msg()
+        hb.frame_id = 'pico_controller_active'
+        self.heartbeat_pub.publish(hb)
 
-    def send_goal(self, waypoint):
+    def disarm(self):
+        self.cmd.rc_roll = 1000
+        self.cmd.rc_yaw = 1000
+        self.cmd.rc_pitch = 1000
+        self.cmd.rc_throttle = 1000
+        self.cmd.rc_aux4 = 1000
+        self.command_pub.publish(self.cmd)
 
-        #create a NavToWaypoint goal object.
-        goal_msg = NavToWaypoint.Goal()  
 
-        goal_msg.waypoint.position.x = waypoint[0]
-        goal_msg.waypoint.position.y = waypoint[1]
-        goal_msg.waypoint.position.z = waypoint[2]
+    def arm(self):
+        self.disarm()
+        self.cmd.rc_roll = 1500
+        self.cmd.rc_yaw = 1500
+        self.cmd.rc_pitch = 1500
+        self.cmd.rc_throttle = 1500
+        self.cmd.rc_aux4 = 2000
+        self.command_pub.publish(self.cmd)
 
-        #create a method waits for the action server to be available.
-        if not self.waypoint_navigation.wait_for_server(timeout_sec=5.0):
-                    self.get_logger().error('Action server not available')
-                    return
 
-        self.send_goal_future = self.action_client.send_goal_async(goal_msg, feedback_callback=self.feedback_callback)    
-        self.send_goal_future.add_done_callback(self.goal_response_callback)
+    # Whycode callback function
+    # The function gets executed each time whycode_node publishes its markers.
+    def whycode_callback(self, msg):
 
-    def goal_response_callback(self, future):
-
-        #complete the goal_response_callback. Refer to Writing an action server and client (Python) in ROS 2 tutorials
-        goal_handle = future.result()
-        if not goal_handle.accepted:
-            self.get_logger().info('Goal rejected :(')
+        if not msg.markers:
+            self.get_logger().warn("No markers received")
             return
 
-        self.get_logger().info('Goal accepted :)')
+        marker = msg.markers[0]
+        position = marker.position.position
+        self.curr_state = [position.x, position.y, position.z]
+        self.drone_position = self.curr_state[:]
 
-        self._get_result_future = goal_handle.get_result_async()
-        self._get_result_future.add_done_callback(self.get_result_callback)
+        # the yaw controller works in degrees, so convert here.
+        self.yaw = math.degrees(marker.rotation.z)
 
-    def get_result_callback(self, future):
+        self.dtime = msg.header.stamp.sec
 
-        #complete the missing line
-        result = future.result().result
-        self.get_logger().info('Result: {0}'.format(result.hov_time))
-
-        self.goal_index += 1
-
-        if self.goal_index < len(self.goals):
-            self.send_goal(self.goals[self.goal_index])
-        else:
-            self.get_logger().info('All waypoints have been reached successfully')      
-
-    def feedback_callback(self, feedback_msg):
-
-        #complete the missing line
-        feedback = feedback_msg.feedback
-        x = feedback.current_waypoint.pose.position.x
-        y = feedback.current_waypoint.pose.position.y
-        z = feedback.current_waypoint.pose.position.z
-        t = feedback.current_waypoint.header.stamp.sec
-        self.get_logger().info(f'Received feedback! The current whycon position is: {x}, {y}, {z}')
-        self.get_logger().info(f'Max time inside sphere: {t}')
+    # If you are using PID controller, then define callback function like altitide_set_pid to tune pitch, roll.
+    #If you are using LQR controller, then define a functions which were given in the boiler plate code of task 1c and the ones which you have defined on yur own.
 
 
-    #service client functions
+    def odometry_callback(self, msg):
+        orientation_q = msg.pose.pose.orientation
+        orientation_list = [orientation_q.x, orientation_q.y, orientation_q.z, orientation_q.w]
+        roll, pitch, yaw = euler_from_quaternion(orientation_list)
 
-    def send_request(self):
-        #  complete send_request method, which will send the request and return a future
-        self.request = GetWaypoints.Request()
-        self.request.get_waypoints = True
-        return self.waypoint_client.call_async(self.request)
-    
-    def receive_goals(self):
-        future = self.send_request()
-        #write a statement to execute the service until the future is complete
-        while not future.done():
-            rclpy.spin_once(self)
+        self.roll_deg = math.degrees(roll)
+        self.pitch_deg = math.degrees(pitch)
+        self.yaw_deg = math.degrees(yaw)
+
+    #define the function to be run inside the timer callback. This function will implement the PID or LQR algorithm. 
+    # This will be either 'pid' finction or 'controller' function as you can see in the boiler plate for PID or LQR for task 1c.
+    # You can also add yaw control here (P, PD or LQR) to hold self.desired_yaw using self.yaw (in degrees, from whycode) and set self.cmd.rc_yaw.
+
+
+
+
+
+
+    def execute_callback(self, goal_handle):
+
+        self.get_logger().info('Executing goal...')
+        self.desired_state[0] = goal_handle.request.waypoint.position.x
+        self.desired_state[1] = goal_handle.request.waypoint.position.y
+        self.desired_state[2] = goal_handle.request.waypoint.position.z
+
+        self.get_logger().info(f'New Waypoint Set: {self.desired_state}')
+        self.max_time_inside_sphere = 0
+        self.point_in_sphere_start_time = None
+        self.time_inside_sphere = 0
+        self.duration = self.dtime
+
+        #create a NavToWaypoint feedback object. Refer to Writing an action server and client (Python) in ROS 2 tutorials.
         
-        response = future.result()
-        self.get_logger().info('Waypoints received by the action client')
+        #--------The script given below checks whether you are hovering at each of the waypoints(goals) for max of 3s---------#
+        # This will help you to analyse the drone behaviour and help you to tune the PID better.
 
-        for pose in response.waypoints.poses:
-            waypoints = [pose.position.x, pose.position.y, pose.position.z]
-            self.goals.append(waypoints)
-            self.get_logger().info(f'Waypoints: {waypoints}')
+        while True:
+			#current whycon poses
+            feedback_msg.current_waypoint.pose.position.x = self.curr_state[0]
+            feedback_msg.current_waypoint.pose.position.y = self.curr_state[1]
+            feedback_msg.current_waypoint.pose.position.z = self.curr_state[2]
+            feedback_msg.current_waypoint.header.stamp.sec = self.max_time_inside_sphere
 
-        self.send_goal(self.goals[0])
-    
+            goal_handle.publish_feedback(feedback_msg)
+
+            drone_is_in_sphere = self.is_drone_in_sphere(self.drone_position, goal_handle, 0.08) 
+
+            # The value 0.08 is in meters used for as error range in Whycon coordinates for LQR controller. If you are using PID controller, it will become 0.8 as PID Whycon coordinates are in decimeters.
+
+            if not drone_is_in_sphere and self.point_in_sphere_start_time is None:
+                        pass
+            
+            elif drone_is_in_sphere and self.point_in_sphere_start_time is None:
+                        self.point_in_sphere_start_time = self.dtime
+                        self.get_logger().info('Drone in sphere for 1st time')                        #you can choose to comment this out to get a better look at other logs
+
+            elif drone_is_in_sphere and self.point_in_sphere_start_time is not None:
+                        self.time_inside_sphere = self.dtime - self.point_in_sphere_start_time
+                        self.get_logger().info('Drone in sphere')                                     #you can choose to comment this out to get a better look at other logs
+                             
+            elif not drone_is_in_sphere and self.point_in_sphere_start_time is not None:
+                        self.get_logger().info('Drone out of sphere')                                 #you can choose to comment this out to get a better look at other logs
+                        self.point_in_sphere_start_time = None
+
+            if self.time_inside_sphere > self.max_time_inside_sphere:
+                 self.max_time_inside_sphere = self.time_inside_sphere
+
+            if self.max_time_inside_sphere >= 3:
+                 break
+                        
+
+        goal_handle.succeed()
+
+        #create a NavToWaypoint result object. Refer to Writing an action server and client (Python) in ROS 2 tutorials
+
+        result.hov_time = self.dtime - self.duration #this is the total time taken by the drone in trying to stabilize at a point
+        return result
+
+    def is_drone_in_sphere(self, drone_pos, sphere_center, radius):
+        return (
+            (drone_pos[0] - sphere_center.request.waypoint.position.x) ** 2
+            + (drone_pos[1] - sphere_center.request.waypoint.position.y) ** 2
+            + (drone_pos[2] - sphere_center.request.waypoint.position.z) ** 2
+        ) <= radius**2
+
 
 def main(args=None):
     rclpy.init(args=args)
 
-    waypoint_client = WayPointClient()
-    waypoint_client.receive_goals()
-
-    try:
-        rclpy.spin(waypoint_client)
-    except KeyboardInterrupt:
-        waypoint_client.get_logger().info('KeyboardInterrupt, shutting down.\n')
-    finally:
-        waypoint_client.destroy_node()
-        rclpy.shutdown()
+    waypoint_server = WayPointServer()
+    executor = MultiThreadedExecutor()
+    executor.add_node(waypoint_server)
     
-    rclpy.shutdown()
+    try:
+         executor.spin()
+    except KeyboardInterrupt:
+        waypoint_server.get_logger().info('KeyboardInterrupt, shutting down.\n')
+    finally:
+         waypoint_server.destroy_node()
+         rclpy.shutdown()
 
 
 if __name__ == '__main__':
     main()
-        
 
