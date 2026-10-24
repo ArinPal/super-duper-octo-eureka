@@ -14,11 +14,11 @@ from rclpy.node import Node
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 
-#import control specific libraries
+# import the messages for action feedback and result
+from swift_pico_interfaces.action import NavToWaypoint_Feedback, NavToWaypoint_Result
 
 #import the action
-from waypoint_navigation.action import NavToWaypoint
-from waypoint_navigation.srv import GetWaypoints
+from swift_pico_interfaces.action import NavToWaypoint
 
 #pico control specific libraries
 from swift_msgs.msg import SwiftMsgs
@@ -60,17 +60,7 @@ class WayPointServer(Node):
         self.cmd.rc_throttle = 1400
 
         #Initiate or declare other variables here depending upon whether you are implementing PID or LQR controller.
-        self.Kp = [0.0, 0.0, 0.0]
-        self.Ki = [0.0, 0.0, 0.0]
-        self.Kd = [0.0, 0.0, 0.0]
-        self.prev_error = [0.0, 0.0, 0.0]
-        self.error_sum = [0.0, 0.0, 0.0]
-        self.max_values = [2000, 2000, 2000]
-        self.min_values = [1000, 1000, 1000]
-        self.pos_error = Error()
-        self.error_sum_limit = 5000.0
 
-        self.sample_time = 0.033 #put the appropriate value according to your controller
 
 
         self.sample_time = 0.01666 #put the appropriate value according to your controller
@@ -81,15 +71,13 @@ class WayPointServer(Node):
 
         self.create_subscription(MarkerArray, '/whycode_node/markers', self.whycode_callback, 1)
         #Add other subscribers here
-        self.create_subscription(PIDTune, "/throttle_pid", self.altitude_set_pid, 1)
-        self.create_subscription(PIDTune, "/pitch_pid", self.pitch_set_pid, 1)
-        self.create_subscription(PIDTune, "/roll_pid", self.roll_set_pid, 1)
 
         self.create_subscription(Odometry, '/rotors/odometry', self.odometry_callback, 10, callback_group=self.odometry_callback_group)
 
         #create an action server for the action 'NavToWaypoint'. Refer to Writing an action server and client (Python) in ROS 2 tutorials
         #action name should 'waypoint_navigation'.
         self.action_server = ActionServer(self, NavToWaypoint, 'waypoint_navigation', self.execute_callback, callback_group=self.action_callback_group)
+
         #include the action_callback_group in the action server. Refer to executors in ROS 2 concepts
 
         
@@ -100,7 +88,49 @@ class WayPointServer(Node):
         self.arm()
 
         #define the function to be run inside the timer callback. This function will implement the PID or LQR algorithm
-        self.timer = self.create_timer(self.sample_time, self.pid_or_lqr_callback, callback_group=self.pid_or_lqr_callback_group)
+        
+        self.timer = self.create_timer(self.sample_time, self.pid, callback_group=self.pid_or_lqr_callback_group)
+
+    def pid(self):
+    #-----------------------------Write the PID algorithm here--------------------------------------------------------------
+   
+    
+        #1
+        error = [ self.current_state[0] - self.desired_state[0],   #Roll
+                  self.current_state[1] - self.desired_state[1],   #Pitch	
+                  self.current_state[2] - self.desired_state[2] ]  #Throttle
+   
+   
+        #3
+        PID_output = [ self.Kp[i] * error[i] + self.Ki[i] * self.error_sum[i] + (self.Kd[i] * (error[i] - self.prev_error[i])) for i in range(3) ]  #Roll, Pitch, Throttle	
+   
+        #4
+        self.cmd.rc_roll = int(1500 - PID_output[0])
+        self.cmd.rc_pitch = int(1500 - PID_output[1])
+        self.cmd.rc_throttle = int(1500 + PID_output[2])
+        
+        #6
+        self.cmd.rc_roll = int(max(self.min_values[0], min(self.max_values[0], self.cmd.rc_roll)))
+        self.cmd.rc_pitch = int(max(self.min_values[1], min(self.max_values[1], self.cmd.rc_pitch)))
+        self.cmd.rc_throttle = int(max(self.min_values[2],min(self.max_values[2], self.cmd.rc_throttle)))
+   
+        #7 AND 8
+        for i in range(3):
+            self.prev_error[i] = error[i]
+            self.error_sum[i] += error[i]*self.sample_time
+            self.error_sum[i] = max(-self.error_sum_limit, min(self.error_sum_limit, self.error_sum[i]))
+   
+   
+   
+    #------------------------------------------------------------------------------------------------------------------------
+        self.command_pub.publish(self.cmd)
+        # calculate throttle error, pitch error and roll error, then publish it accordingly
+        self.pos_error.roll_error = error[0]
+        self.pos_error.pitch_error = error[1]
+        self.pos_error.throttle_error = error[2]
+        self.pos_error_pub.publish(self.pos_error)
+   
+
 
     def publish_heartbeat(self):
         hb = Header()
@@ -148,6 +178,25 @@ class WayPointServer(Node):
     # If you are using PID controller, then define callback function like altitide_set_pid to tune pitch, roll.
     #If you are using LQR controller, then define a functions which were given in the boiler plate code of task 1c and the ones which you have defined on yur own.
 
+    # Callback function for /throttle_pid
+        # This function gets executed each time when /drone_pid_tuner publishes /throttle_pid
+        def altitude_set_pid(self, alt):
+            self.Kp[2] = alt.kp   # This is just for an example. You can change the ratio/fraction value accordingly
+            self.Ki[2] = alt.ki 
+            self.Kd[2] = alt.kd 
+    
+        #----------------------------Define callback function like altitide_set_pid to tune pitch, roll--------------
+        def pitch_set_pid(self, pitch): 
+            self.Kp[1] = pitch.kp 
+            self.Ki[1] = pitch.ki 
+            self.Kd[1] = pitch.kd 
+    
+    
+        def roll_set_pid(self, roll):
+            self.Kp[0] = roll.kp 
+            self.Ki[0] = roll.ki 
+            self.Kd[0] = roll.kd 
+            
 
     def odometry_callback(self, msg):
         orientation_q = msg.pose.pose.orientation
@@ -158,13 +207,7 @@ class WayPointServer(Node):
         self.pitch_deg = math.degrees(pitch)
         self.yaw_deg = math.degrees(yaw)
 
-    #define the function to be run inside the timer callback. This function will implement the PID or LQR algorithm. 
-    # This will be either 'pid' finction or 'controller' function as you can see in the boiler plate for PID or LQR for task 1c.
-    # You can also add yaw control here (P, PD or LQR) to hold self.desired_yaw using self.yaw (in degrees, from whycode) and set self.cmd.rc_yaw.
-
-
-
-
+   
 
 
     def execute_callback(self, goal_handle):
@@ -181,18 +224,19 @@ class WayPointServer(Node):
         self.duration = self.dtime
 
         #create a NavToWaypoint feedback object. Refer to Writing an action server and client (Python) in ROS 2 tutorials.
+        self.feedback_msg = NavToWaypoint_Feedback()
         
         #--------The script given below checks whether you are hovering at each of the waypoints(goals) for max of 3s---------#
         # This will help you to analyse the drone behaviour and help you to tune the PID better.
 
         while True:
 			#current whycon poses
-            feedback_msg.current_waypoint.pose.position.x = self.curr_state[0]
-            feedback_msg.current_waypoint.pose.position.y = self.curr_state[1]
-            feedback_msg.current_waypoint.pose.position.z = self.curr_state[2]
-            feedback_msg.current_waypoint.header.stamp.sec = self.max_time_inside_sphere
+            self.feedback_msg.current_waypoint.pose.position.x = self.curr_state[0]
+            self.feedback_msg.current_waypoint.pose.position.y = self.curr_state[1]
+            self.feedback_msg.current_waypoint.pose.position.z = self.curr_state[2]
+            self.feedback_msg.current_waypoint.header.stamp.sec = self.max_time_inside_sphere
 
-            goal_handle.publish_feedback(feedback_msg)
+            goal_handle.publish_feedback(self.feedback_msg)
 
             drone_is_in_sphere = self.is_drone_in_sphere(self.drone_position, goal_handle, 0.08) 
 
@@ -223,9 +267,10 @@ class WayPointServer(Node):
         goal_handle.succeed()
 
         #create a NavToWaypoint result object. Refer to Writing an action server and client (Python) in ROS 2 tutorials
+        self.result = NavToWaypoint_Result()
 
-        result.hov_time = self.dtime - self.duration #this is the total time taken by the drone in trying to stabilize at a point
-        return result
+        self.result.hov_time = self.dtime - self.duration #this is the total time taken by the drone in trying to stabilize at a point
+        return self.result
 
     def is_drone_in_sphere(self, drone_pos, sphere_center, radius):
         return (
