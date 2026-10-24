@@ -34,6 +34,7 @@ class Swift_Pico(Node):
 		# This corresponds to your current position of drone. This value must be updated in your whycode callback
 		# [x,y,z]
 		self.current_state = [0.0, 0.0, 0.0]
+		
 
 
 
@@ -61,8 +62,12 @@ class Swift_Pico(Node):
 
 		#-----------------------Add other required variables for pid here ----------------------------------------------
 
-
-
+		self.prev_error = [0, 0, 0]  # previous error for each axis
+		self.error_sum = [0, 0, 0]  # sum of errors
+		self.error_sum_limit = 5000.0
+		self.max_values = [2000, 2000, 2000]  
+		self.min_values = [1000, 1000, 1000]   
+		
 
 
 
@@ -91,6 +96,8 @@ class Swift_Pico(Node):
 		self.create_subscription(PIDTune, "/throttle_pid", self.altitude_set_pid, 1)
 
 		#------------------------Add other ROS Subscribers here-----------------------------------------------------
+		self.create_subscription(PIDTune, "/pitch_pid", self.pitch_set_pid, 1)					#added by me
+		self.create_subscription(PIDTune, "/roll_pid", self.roll_set_pid, 1)					#added by me
 
 		self.publish_heartbeat()
 		self.create_timer(0.1, self.publish_heartbeat)
@@ -99,6 +106,7 @@ class Swift_Pico(Node):
 		self.arm()  # ARMING THE DRONE
 
 		# Creating a timer to run the pid function periodically, refer ROS 2 tutorials on how to create a publisher subscriber(Python)
+		self.timer=self.create_timer(self.sample_time, self.pid) 
 
 
 	def publish_heartbeat(self):
@@ -131,8 +139,8 @@ class Swift_Pico(Node):
 	def whycode_callback(self, msg):
 		self.current_state[0] = msg.markers[0].position.position.x
 		#--------------------Set the remaining co-ordinates of the drone from msg----------------------------------------------
-
-
+		self.current_state[1] = msg.markers[0].position.position.y
+		self.current_state[2] = msg.markers[0].position.position.z
 
 	
 		#---------------------------------------------------------------------------------------------------------------
@@ -146,7 +154,16 @@ class Swift_Pico(Node):
 		self.Kd[2] = alt.kd * 0.6
 
 	#----------------------------Define callback function like altitide_set_pid to tune pitch, roll--------------
+	def pitch_set_pid(self, pitch): 
+		self.Kp[1] = pitch.kp * 0.03
+		self.Ki[1] = pitch.ki * 0.008
+		self.Kd[1] = pitch.kd * 0.6
 
+
+	def roll_set_pid(self, roll):
+		self.Kp[0] = roll.kp * 0.03
+		self.Ki[0] = roll.ki * 0.008
+		self.Kd[0] = roll.kd * 0.6
 	#----------------------------------------------------------------------------------------------------------------------
 
 
@@ -163,20 +180,30 @@ class Swift_Pico(Node):
 	#																														self.cmd.rcPitch = self.max_values[1]
 	#	7. Update previous errors.eg: self.prev_error[1] = error[1] where index 1 corresponds to that of pitch (eg)
 	#	8. Add error_sum
+	
+		#1
+		error = [ self.current_state[0] - self.desired_state[0],   #Roll
+		          self.current_state[1] - self.desired_state[1],   #Pitch	
+				  self.current_state[2] - self.desired_state[2] ]  #Throttle
 
+		#7 AND 8
+		for i in range(3):
+			self.prev_error[i] = error[i]
+			self.error_sum[i] += error[i]
+			self.error_sum[i] = max(-self.error_sum_limit, min(self.error_sum_limit, self.error_sum[i]))
 
+		#3
+		PID_output = [ self.Kp[i] * error[i] + self.Ki[i] * self.error_sum[i] + self.Kd[i] * (error[i] - self.prev_error[i]) for i in range(3) ]  #Roll, Pitch, Throttle	
 
-
-
-
-
-
-
-
-
-
-
-
+		#4
+		self.cmd.rc_roll = (1500 - PID_output[0])
+		self.cmd.rc_pitch = (1500 - PID_output[1])
+		self.cmd.rc_throttle = (1500 + PID_output[2])
+		
+		#6
+		self.cmd.rc_roll = max(self.min_values[0], min(self.max_values[0], PID_output[0]))
+		self.cmd.rc_pitch = max(self.min_values[1], min(self.max_values[1], PID_output[1]))
+		self.cmd.rc_throttle = max(self.min_values[2], min(self.max_values[2], PID_output[2]))
 
 
 
@@ -184,6 +211,9 @@ class Swift_Pico(Node):
 	#------------------------------------------------------------------------------------------------------------------------
 		self.command_pub.publish(self.cmd)
 		# calculate throttle error, pitch error and roll error, then publish it accordingly
+		self.pos_error.roll_error = error[0]
+		self.pos_error.pitch_error = error[1]
+		self.pos_error.throttle_error = error[2]
 		self.pos_error_pub.publish(self.pos_error)
 
 
